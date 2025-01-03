@@ -2,11 +2,13 @@ import argparse
 import json
 import os
 import logging
-from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Text, ForeignKey
-from sqlalchemy.orm import relationship, sessionmaker, declarative_base
+from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Text, ForeignKey, JSON
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 from urllib.parse import quote
 from eralchemy import render_er
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -21,76 +23,44 @@ Base = declarative_base()
 class Trace(Base):
     __tablename__ = 'traces'
     trace_id = Column(String(50), primary_key=True)
-    # spans = relationship("Span", back_populates="trace")
 
 
 class Span(Base):
     __tablename__ = 'spans'
     span_id = Column(String(50), primary_key=True)
     trace_id = Column(String(50), ForeignKey('traces.trace_id'))
-    operation_name = Column(Text)
+    operation_name = Column(Text, index=True)
     flags = Column(Integer)
     start_time = Column(BigInteger)
     duration = Column(BigInteger)
     process_id = Column(String(50), ForeignKey('processes.process_id'))
+    service_name = Column(Text)
     warnings = Column(Text, nullable=True)
-    # omitting these as we're just inserting data and won't be using ORM to access data
-    # tags = relationship("Tag", back_populates="span")
-    # logs = relationship("Log", back_populates="span")
-    # trace = relationship("Trace", back_populates="spans")
+    tags = Column(JSONB)  # JSON array for tags
 
 
-class SpanReference(Base):
-    __tablename__ = 'span_references'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    span_id = Column(String(50), ForeignKey('spans.span_id'))
-    ref_type = Column(Text)  # "CHILD_OF" or "FOLLOWS_FROM"
-    ref_span_id = Column(String(50)) # the referenced span (parent or prior)
-
-
-class Tag(Base):
-    __tablename__ = 'tags'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    span_id = Column(String(50), ForeignKey('spans.span_id'))
-    key = Column(Text)
-    type = Column(Text)
-    value = Column(Text)
-    # span = relationship("Span", back_populates="tags")
+class ParentChildRelation(Base):
+    __tablename__ = 'parent_child_relations'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trace_id = Column(String(50), ForeignKey('traces.trace_id'))
+    child_span_id = Column(String(50))
+    parent_span_id = Column(String(50))
 
 
 class Log(Base):
     __tablename__ = 'logs'
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     span_id = Column(String(50), ForeignKey('spans.span_id'))
     timestamp = Column(BigInteger)
     log_message = Column(Text, nullable=True)
-    # span = relationship("Span", back_populates="logs")
-
-
-class LogField(Base):
-    __tablename__ = 'log_fields'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    log_id = Column(Integer, ForeignKey('logs.id'))
-    key = Column(Text)
-    type = Column(Text)
-    value = Column(Text)
+    fields = Column(JSONB)  # JSON array for log fields
 
 
 class Process(Base):
     __tablename__ = 'processes'
     process_id = Column(String(50), primary_key=True)
     service_name = Column(Text)
-    # tags = relationship("ProcessTag", back_populates="process")
-
-
-class ProcessTag(Base):
-    __tablename__ = 'process_tags'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    process_id = Column(String(50), ForeignKey('processes.process_id'))
-    key = Column(Text)
-    type = Column(Text)
-    value = Column(Text)
-    # process = relationship("Process", back_populates="tags")
+    tags = Column(JSONB)  # JSON array for process tags
 
 
 def get_engine():
@@ -102,20 +72,22 @@ def get_engine():
 
 def insert_data(session, trace_data):
     for trace in trace_data['data']:
-
         trace_obj = Trace(trace_id=trace['traceID'])
         session.merge(trace_obj)
 
         processes = trace.get('processes', {})
         for process_id, process_data in processes.items():
-            process_obj = Process(process_id=process_id, service_name=process_data['serviceName'])
+            tags = [{tag['key']: tag['value']} for tag in process_data.get('tags', [])]
+            process_obj = Process(
+                process_id=process_id,
+                service_name=process_data['serviceName'],
+                tags=tags
+            )
             session.merge(process_obj)
 
-            for tag in process_data.get('tags', []):
-                tag_obj = ProcessTag(process_id=process_id, key=tag['key'], type=tag['type'], value=str(tag['value']))
-                session.add(tag_obj)
-
         for span in trace['spans']:
+            tags = [{tag['key']: tag['value']} for tag in span.get('tags', [])]
+            service_name = processes.get(span['processID'], {}).get('serviceName', None)
             span_obj = Span(
                 span_id=span['spanID'],
                 trace_id=span['traceID'],
@@ -124,31 +96,38 @@ def insert_data(session, trace_data):
                 start_time=span['startTime'],
                 duration=span['duration'],
                 process_id=span['processID'],
+                service_name=service_name,
                 warnings=span.get('warnings'),
+                tags=tags
             )
             session.merge(span_obj)
 
-            references_list = span.get('references', [])
-            for ref in references_list:
-                ref_obj = SpanReference(
-                    span_id=span['spanID'],
-                    ref_type=ref.get('refType'),
-                    ref_span_id=ref.get('spanID')
+            for ref in span.get('references', []):
+                if ref['refType'] == "CHILD_OF":
+                    child_span_id = span['spanID']
+                    parent_span_id = ref.get('spanID')
+                elif ref['refType'] == "FOLLOWS_FROM":
+                    parent_span_id = span['spanID']
+                    child_span_id = ref.get('spanID')
+                else:
+                    continue
+
+                ref_obj = ParentChildRelation(
+                    trace_id=span['traceID'],
+                    child_span_id=child_span_id,
+                    parent_span_id=parent_span_id
                 )
                 session.add(ref_obj)
 
-            for tag in span.get('tags', []):
-                tag_obj = Tag(span_id=span['spanID'], key=tag['key'], type=tag['type'], value=str(tag['value']))
-                session.add(tag_obj)
-
             for log in span.get('logs', []):
-                log_obj = Log(span_id=span['spanID'], timestamp=log['timestamp'], log_message=log.get('message'))
+                fields = [{field['key']: field['value']} for field in log.get('fields', [])]
+                log_obj = Log(
+                    span_id=span['spanID'],
+                    timestamp=log['timestamp'],
+                    log_message=log.get('message'),
+                    fields=fields
+                )
                 session.add(log_obj)
-                session.flush()  # To retrieve the auto-generated log_id
-
-                for field in log.get('fields', []):
-                    field_obj = LogField(log_id=log_obj.id, key=field['key'], type=field['type'], value=str(field['value']))
-                    session.add(field_obj)
 
     session.commit()
 
@@ -179,8 +158,6 @@ def main():
 
     with session_factory() as session:
         insert_data(session, trace_data)
-
-    insert_data(session, trace_data)
 
     generate_erd()
 
